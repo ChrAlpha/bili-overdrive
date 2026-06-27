@@ -4,6 +4,12 @@
 
 A Tampermonkey userscript that forces manual playback-speed control on Bilibili, even when you're logged out (Bilibili disables its speed menu and resets `playbackRate` to `1×` for logged-out users).
 
+<p align="center">
+  <img src="./assets/bili-speed.png" alt="未登录时 B 站倍速菜单显示「登录可享」 / Bilibili's speed menu shows '登录可享' (login required) when logged out" width="320">
+  <br>
+  <em>未登录时倍速被锁为「登录可享」—— 本脚本绕过它。<br>Logged out, the speed menu is locked behind “登录可享” — this script bypasses it.</em>
+</p>
+
 ## 功能 Features
 
 - **强制调速**：重写 `HTMLMediaElement.prototype.playbackRate`，拦截 B 站把倍速复位到 `1×` 的行为，让你设定的倍速「粘住」。
