@@ -2,7 +2,7 @@
 // @name         Bili Overdrive 强制倍速
 // @name:en      Bili Overdrive - Force Playback Speed
 // @namespace    https://github.com/ChrAlpha/bili-overdrive
-// @version      2.0.0
+// @version      2.0.1
 // @description  强制手动控制 Bilibili 播放倍速，未登录也能用。自带倍速菜单原位接管播放器「倍速」按钮 + 快捷键，记忆上次倍速。
 // @description:en  Force manual playback-speed control on Bilibili even when logged out. A self-contained speed menu takes over the player's native 倍速 slot, plus keyboard shortcuts, remembers last speed.
 // @author       ChrAlpha
@@ -261,20 +261,24 @@
     // box-sizing/margin/padding resets, because this control lives in the light
     // DOM (inside the player's control bar) where site CSS can otherwise cascade
     // onto our generic <div>/<ul>/<li> nodes.
+    //
+    // The control element also wears Bilibili's own `bpx-player-ctrl-btn` class
+    // so it inherits the correct button height/line-height for the *current*
+    // player mode (the bar grows from 22px to 43px tall in fullscreen / web
+    // fullscreen). We deliberately do NOT hard-code height/line-height here, so
+    // our 倍速 text stays vertically aligned with its neighbours in every mode.
     style.textContent = `
       /* Replace Bilibili's native speed control with our own. */
       .bpx-player-ctrl-playbackrate { display: none !important; }
 
       #bili-overdrive-ctrl.bod-ctrl {
-        display: block; position: relative; box-sizing: border-box;
-        height: 22px; line-height: 22px; margin: 0 10px 0 0;
-        cursor: pointer; outline: none; color: #fff; font-size: 14px;
+        position: relative; box-sizing: border-box; min-width: 50px;
+        margin: 0 10px 0 0; cursor: pointer; outline: none; color: #fff;
       }
       #bili-overdrive-ctrl .bod-result {
-        box-sizing: border-box; margin: 0; padding: 0;
-        height: 22px; line-height: 22px; min-width: 50px;
+        box-sizing: border-box; margin: 0; padding: 0; min-width: 50px;
         font-size: 14px; font-weight: 600; white-space: nowrap;
-        text-align: center; color: #fff;
+        text-align: center; color: #fff; cursor: pointer;
       }
       /* Transparent hover bridge, as wide as the menu, so moving the cursor up
          to the menu (incl. its overhanging edges) never drops :hover. */
@@ -310,7 +314,9 @@
 
   function buildBarControl() {
     const ctrl = document.createElement('div');
-    ctrl.className = 'bod-ctrl';
+    // Reuse Bilibili's native button class for per-mode layout (height /
+    // line-height / vertical centering); `bod-ctrl` adds our own positioning.
+    ctrl.className = 'bpx-player-ctrl-btn bod-ctrl';
     ctrl.id = 'bili-overdrive-ctrl';
     ctrl.setAttribute('role', 'button');
     ctrl.setAttribute('aria-label', '倍速');
