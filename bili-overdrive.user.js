@@ -2,9 +2,9 @@
 // @name         Bili Overdrive 强制倍速
 // @name:en      Bili Overdrive - Force Playback Speed
 // @namespace    https://github.com/ChrAlpha/bili-overdrive
-// @version      1.0.0
-// @description  强制手动控制 Bilibili 播放倍速，未登录也能用。浮动面板 + 快捷键，记忆上次倍速。
-// @description:en  Force manual playback-speed control on Bilibili even when logged out. Floating panel + keyboard shortcuts, remembers last speed.
+// @version      2.0.0
+// @description  强制手动控制 Bilibili 播放倍速，未登录也能用。自带倍速菜单原位接管播放器「倍速」按钮 + 快捷键，记忆上次倍速。
+// @description:en  Force manual playback-speed control on Bilibili even when logged out. A self-contained speed menu takes over the player's native 倍速 slot, plus keyboard shortcuts, remembers last speed.
 // @author       ChrAlpha
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/bangumi/play/*
@@ -28,7 +28,7 @@
    * Config — tweak these freely.                                        *
    * ------------------------------------------------------------------ */
   const CONFIG = {
-    presets: [0.5, 0.75, 1, 1.25, 1.5, 2, 3, 5],
+    presets: [0.5, 0.75, 1, 1.25, 1.5, 2, 3],
     step: 0.25,      // keyboard fine step
     min: 0.25,
     max: 16,
@@ -74,7 +74,9 @@
    * ------------------------------------------------------------------ */
   const round2 = (n) => Math.round(n * 100) / 100;
   const clamp = (n) => Math.min(CONFIG.max, Math.max(CONFIG.min, round2(n)));
-  const formatRate = (r) => (+r.toFixed(2)).toString() + '×'; // e.g. 1.25×
+  const formatRate = (r) => (+r.toFixed(2)).toString() + '×'; // toast: e.g. 1.25×
+  // Bilibili-native label style for the in-bar control: "2.0x", "1.25x", "0.5x".
+  const nativeLabel = (r) => (Number.isInteger(r) ? r.toFixed(1) : String(+r.toFixed(2))) + 'x';
 
   /* ------------------------------------------------------------------ *
    * State.                                                              *
@@ -84,9 +86,18 @@
   // Patch the page's real prototype (not the userscript sandbox's view).
   const win = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 
-  // Guard against a second instance in the same page realm (e.g. installed
-  // twice). The flag lives on the shared page window so it is visible across
-  // separate sandbox instances; bail before adding listeners/intervals/UI.
+  // Guard against a second instance (e.g. installed twice). Prefer a sentinel
+  // attribute on <html>: it is a shared DOM node visible across every sandbox
+  // realm and always writable, so it works even on managers that don't share
+  // unsafeWindow. The window flag is a belt-and-suspenders fallback. Bail before
+  // adding listeners/intervals/UI.
+  try {
+    const rootEl = document.documentElement;
+    if (rootEl) {
+      if (rootEl.hasAttribute('data-bili-overdrive')) return;
+      rootEl.setAttribute('data-bili-overdrive', '1');
+    }
+  } catch (e) { /* ignore */ }
   try {
     if (win.__biliOverdriveInit) return;
     win.__biliOverdriveInit = true;
@@ -132,7 +143,9 @@
         v = Number(v);
         if (!isFinite(v) || v <= 0) return; // ignore garbage writes
         // Bilibili's logged-out reset forces 1x. Block it and re-assert ours.
-        if (v === 1 && desiredRate !== 1) {
+        // Use the same clamp/round2 normalization as the adopt branch below so
+        // a near-1 reset (e.g. 1.001) can't slip through and clobber the rate.
+        if (clamp(v) === 1 && desiredRate !== 1) {
           nativeSet.call(this, desiredRate);
           return;
         }
@@ -182,16 +195,28 @@
   const stepRate = (delta, opts) => setDesiredRate(desiredRate + delta, opts);
 
   /* ------------------------------------------------------------------ *
-   * UI — built inside a Shadow DOM so Bilibili's CSS cannot reach in.    *
+   * UI — two surfaces, both fully self-owned:                           *
+   *   1. An in-player speed control that takes over the native 倍速      *
+   *      slot in the control bar (light DOM, styled to match natively).  *
+   *   2. A transient center toast for keyboard changes (Shadow DOM).     *
+   * We render our own menu so we depend on Bilibili only for an anchor   *
+   * element — never on its (lockable) speed menu, handlers, or classes.  *
    * ------------------------------------------------------------------ */
+
+  // Toast (Shadow DOM, isolated from site CSS).
   let shadow = null;
   let host = null;
-  let panelEl = null;
-  let rateEl = null;
-  let presetEls = [];
   let toastEl = null;
   let toastTimer = null;
+
+  // In-bar control (light DOM, lives inside the player's control bar).
+  let barCtrl = null;
+  let barResultEl = null;
+  let barItemEls = [];
+  let cssInjected = false;
+
   let uiRaf = 0;
+  let mountScheduled = 0;
 
   function scheduleUiUpdate() {
     if (uiRaf) return;
@@ -204,186 +229,193 @@
     }, 0);
   }
 
+  // Coalesce MutationObserver bursts (Bilibili churns the DOM constantly) into
+  // at most one ensureBarControl() per frame-ish window.
+  function scheduleMount() {
+    if (mountScheduled) return;
+    mountScheduled = setTimeout(() => {
+      mountScheduled = 0;
+      ensureBarControl();
+    }, 50);
+  }
+
   function updateUi() {
-    if (rateEl) rateEl.textContent = formatRate(desiredRate);
-    for (const el of presetEls) {
-      const active = Math.abs(parseFloat(el.dataset.r) - desiredRate) < 1e-6;
-      el.classList.toggle('active', active);
+    // In-bar control: result text mirrors native (倍速 at 1x, else "1.5x").
+    if (barResultEl) {
+      barResultEl.textContent =
+        Math.abs(desiredRate - 1) < 1e-6 ? '倍速' : nativeLabel(desiredRate);
+    }
+    for (const li of barItemEls) {
+      const active = Math.abs(parseFloat(li.dataset.r) - desiredRate) < 1e-6;
+      li.classList.toggle('bod-active', active);
     }
   }
 
-  function buildUi() {
+  /* ---- Styles: hide the native control, dress ours to match. -------- */
+  function injectCss() {
+    if (cssInjected) return;
+    if (!document.documentElement) return;
+    const style = document.createElement('style');
+    style.id = 'bili-overdrive-style';
+    // Selectors are scoped under #bili-overdrive-ctrl and carry explicit
+    // box-sizing/margin/padding resets, because this control lives in the light
+    // DOM (inside the player's control bar) where site CSS can otherwise cascade
+    // onto our generic <div>/<ul>/<li> nodes.
+    style.textContent = `
+      /* Replace Bilibili's native speed control with our own. */
+      .bpx-player-ctrl-playbackrate { display: none !important; }
+
+      #bili-overdrive-ctrl.bod-ctrl {
+        display: block; position: relative; box-sizing: border-box;
+        height: 22px; line-height: 22px; margin: 0 10px 0 0;
+        cursor: pointer; outline: none; color: #fff; font-size: 14px;
+      }
+      #bili-overdrive-ctrl .bod-result {
+        box-sizing: border-box; margin: 0; padding: 0;
+        height: 22px; line-height: 22px; min-width: 50px;
+        font-size: 14px; font-weight: 600; white-space: nowrap;
+        text-align: center; color: #fff;
+      }
+      /* Transparent hover bridge, as wide as the menu, so moving the cursor up
+         to the menu (incl. its overhanging edges) never drops :hover. */
+      #bili-overdrive-ctrl::after {
+        content: ''; position: absolute; bottom: 100%;
+        left: 50%; transform: translateX(-50%); width: 72px; height: 14px;
+        display: none;
+      }
+      #bili-overdrive-ctrl:hover::after, #bili-overdrive-ctrl:focus-within::after { display: block; }
+      #bili-overdrive-ctrl .bod-menu {
+        display: none; position: absolute; left: 50%; bottom: calc(100% + 12px);
+        transform: translateX(-50%); margin: 0; padding: 0; list-style: none;
+        width: 72px; box-sizing: border-box;
+        background-color: rgba(20, 20, 20, 0.9); border-radius: 2px;
+        text-align: center; z-index: 100;
+      }
+      #bili-overdrive-ctrl:hover .bod-menu, #bili-overdrive-ctrl:focus-within .bod-menu { display: block; }
+      #bili-overdrive-ctrl .bod-item {
+        box-sizing: border-box; margin: 0; padding: 0;
+        height: 36px; line-height: 36px; cursor: pointer;
+        color: #fff; font-size: 14px; list-style: none;
+      }
+      #bili-overdrive-ctrl .bod-item:hover { background-color: rgba(255, 255, 255, 0.1); }
+      #bili-overdrive-ctrl .bod-item.bod-active { color: var(--bpx-primary-color, #00AEEC); font-weight: 600; }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+    cssInjected = true;
+  }
+
+  /* ---- The in-bar speed control. ----------------------------------- */
+  // Presets ordered high -> low, matching the native menu.
+  const menuOrder = () => CONFIG.presets.slice().sort((a, b) => b - a);
+
+  function buildBarControl() {
+    const ctrl = document.createElement('div');
+    ctrl.className = 'bod-ctrl';
+    ctrl.id = 'bili-overdrive-ctrl';
+    ctrl.setAttribute('role', 'button');
+    ctrl.setAttribute('aria-label', '倍速');
+    ctrl.setAttribute('tabindex', '0');
+
+    const result = document.createElement('div');
+    result.className = 'bod-result';
+    result.textContent = '倍速';
+
+    const menu = document.createElement('ul');
+    menu.className = 'bod-menu';
+
+    barItemEls = menuOrder().map((r) => {
+      const li = document.createElement('li');
+      li.className = 'bod-item';
+      li.dataset.r = String(r);
+      li.textContent = nativeLabel(r);
+      li.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setDesiredRate(r);
+      });
+      menu.appendChild(li);
+      return li;
+    });
+
+    ctrl.appendChild(result);
+    ctrl.appendChild(menu);
+    barCtrl = ctrl;
+    barResultEl = result;
+    return ctrl;
+  }
+
+  // Mount (or remount) our control in the native 倍速 slot. Idempotent and
+  // cheap; called on a timer so it survives Bilibili's SPA re-renders.
+  function ensureBarControl() {
+    injectCss();
+    const native = document.querySelector('.bpx-player-ctrl-playbackrate');
+
+    // Already mounted: keep it parked right where the native control would be.
+    if (barCtrl && document.documentElement.contains(barCtrl)) {
+      if (native) {
+        native.style.display = 'none';
+        if (native.previousElementSibling !== barCtrl && native.parentElement) {
+          native.parentElement.insertBefore(barCtrl, native);
+        }
+      }
+      return;
+    }
+
+    // Pick an anchor: the native slot first, then the control-bar containers.
+    const parent =
+      (native && native.parentElement) ||
+      document.querySelector('.bpx-player-control-bottom-right') ||
+      document.querySelector('.bpx-player-control-bottom');
+    if (!parent) return; // control bar not ready yet — retry next tick
+
+    const ctrl = buildBarControl();
+    if (native) {
+      native.style.display = 'none';
+      native.parentElement.insertBefore(ctrl, native);
+    } else {
+      parent.appendChild(ctrl);
+    }
+    updateUi();
+  }
+
+  /* ---- The toast (Shadow DOM). ------------------------------------- */
+  function buildToast() {
     if (host && document.documentElement.contains(host)) return;
     if (!document.documentElement) return;
 
     host = document.createElement('div');
     host.id = 'bili-overdrive-host';
-    // Zero-size anchor; children are independently fixed-positioned.
     host.style.cssText =
       'all: initial; position: fixed; top: 0; left: 0; width: 0; height: 0; ' +
       'z-index: 2147483647; pointer-events: none;';
     shadow = host.attachShadow({ mode: 'open' });
-
     shadow.innerHTML = `
       <style>
         :host { all: initial; }
-        * { box-sizing: border-box; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
-        .panel {
-          position: fixed; right: 24px; bottom: 140px; pointer-events: auto;
-          display: flex; flex-direction: column; gap: 6px;
-          padding: 8px; border-radius: 12px;
-          background: rgba(24, 26, 33, 0.92); color: #f1f2f6;
-          box-shadow: 0 6px 24px rgba(0,0,0,0.45); backdrop-filter: blur(6px);
-          user-select: none; font-size: 13px; line-height: 1;
-          border: 1px solid rgba(255,255,255,0.08);
-        }
-        .bar { display: flex; align-items: center; gap: 6px; }
-        .rate {
-          min-width: 56px; text-align: center; cursor: move;
-          font-weight: 700; font-size: 15px; padding: 4px 6px;
-          color: #00a1d6; letter-spacing: .5px;
-        }
-        .btn {
-          all: unset; cursor: pointer; text-align: center;
-          min-width: 28px; height: 26px; line-height: 26px; padding: 0 8px;
-          border-radius: 7px; background: rgba(255,255,255,0.08);
-          color: #f1f2f6; font-size: 14px; transition: background .12s;
-        }
-        .btn:hover { background: rgba(255,255,255,0.18); }
-        .btn.reset { font-size: 12px; min-width: 34px; }
-        .btn.toggle { min-width: 26px; padding: 0; opacity: .8; }
-        .presets { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; }
-        .presets.hidden { display: none; }
-        .preset {
-          all: unset; cursor: pointer; text-align: center;
-          height: 24px; line-height: 24px; border-radius: 6px;
-          background: rgba(255,255,255,0.06); color: #cfd3dc; font-size: 12px;
-          transition: background .12s, color .12s;
-        }
-        .preset:hover { background: rgba(255,255,255,0.16); color: #fff; }
-        .preset.active { background: #00a1d6; color: #fff; font-weight: 700; }
-        .btn:focus-visible, .preset:focus-visible { outline: 2px solid #00a1d6; outline-offset: 1px; }
         .toast {
           position: fixed; left: 50%; top: 14%; transform: translateX(-50%);
           pointer-events: none; padding: 8px 18px; border-radius: 10px;
           background: rgba(0,0,0,0.78); color: #fff; font-size: 22px; font-weight: 700;
           opacity: 0; transition: opacity .18s; letter-spacing: 1px;
+          font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
         }
         .toast.show { opacity: 1; }
       </style>
-      <div class="panel">
-        <div class="bar">
-          <button class="btn dec" title="减速 [ ">−</button>
-          <span class="rate" title="拖动可移动 · 当前倍速">1×</span>
-          <button class="btn inc" title="加速 ] ">+</button>
-          <button class="btn reset" title="恢复 1× ( \\ )">1×</button>
-          <button class="btn toggle" title="折叠/展开">⋯</button>
-        </div>
-        <div class="presets"></div>
-      </div>
       <div class="toast"></div>
     `;
-
-    const panel = shadow.querySelector('.panel');
-    panelEl = panel;
-    const presetsWrap = shadow.querySelector('.presets');
-    rateEl = shadow.querySelector('.rate');
     toastEl = shadow.querySelector('.toast');
-
-    shadow.querySelector('.dec').addEventListener('click', () => stepRate(-CONFIG.step));
-    shadow.querySelector('.inc').addEventListener('click', () => stepRate(+CONFIG.step));
-    shadow.querySelector('.reset').addEventListener('click', () => setDesiredRate(1));
-    shadow.querySelector('.toggle').addEventListener('click', () => {
-      const hidden = presetsWrap.classList.toggle('hidden');
-      store.set('collapsed', hidden);
-    });
-    if (store.get('collapsed', false)) presetsWrap.classList.add('hidden');
-
-    presetEls = CONFIG.presets.map((r) => {
-      const b = document.createElement('button');
-      b.className = 'preset';
-      b.dataset.r = String(r);
-      b.textContent = String(r);
-      b.addEventListener('click', () => setDesiredRate(r));
-      presetsWrap.appendChild(b);
-      return b;
-    });
-
-    restorePanelPosition(panel);
-    enableDrag(panel, rateEl);
-
     document.documentElement.appendChild(host);
-    clampPanel();    // keep a restored position within the current viewport
-    relocateHost();  // if we're already in fullscreen, mount into that subtree
-    updateUi();
-  }
-
-  function restorePanelPosition(panel) {
-    const pos = store.get('pos', null);
-    if (pos && typeof pos.left === 'number' && typeof pos.top === 'number') {
-      panel.style.left = pos.left + 'px';
-      panel.style.top = pos.top + 'px';
-      panel.style.right = 'auto';
-      panel.style.bottom = 'auto';
-    }
-  }
-
-  // Keep a left/top-positioned panel inside the viewport (e.g. after the window
-  // shrinks or fullscreen exits) so the drag handle never ends up off-screen.
-  function clampPanel() {
-    if (!panelEl) return;
-    if (!panelEl.style.left && !panelEl.style.top) return; // still anchored bottom/right
-    const maxL = Math.max(0, win.innerWidth - panelEl.offsetWidth);
-    const maxT = Math.max(0, win.innerHeight - panelEl.offsetHeight);
-    const left = Math.min(maxL, Math.max(0, parseFloat(panelEl.style.left) || 0));
-    const top = Math.min(maxT, Math.max(0, parseFloat(panelEl.style.top) || 0));
-    panelEl.style.left = left + 'px';
-    panelEl.style.top = top + 'px';
+    relocateHost(); // if we're already in fullscreen, mount into that subtree
   }
 
   // Native fullscreen promotes the player container to the browser top layer,
-  // where only its descendants paint. Re-parent our shadow host into the
-  // fullscreen element so the panel + toast stay visible; move it back on exit.
+  // where only its descendants paint. Re-parent our toast host into the
+  // fullscreen element so it stays visible; move it back on exit.
   function relocateHost() {
     if (!host) return;
     const fs = document.fullscreenElement || document.webkitFullscreenElement || null;
     const parent = fs || document.documentElement;
     if (host.parentNode !== parent) parent.appendChild(host);
-  }
-
-  function enableDrag(panel, handle) {
-    let dragging = false, startX = 0, startY = 0, baseLeft = 0, baseTop = 0;
-    handle.addEventListener('pointerdown', (e) => {
-      dragging = true;
-      const rect = panel.getBoundingClientRect();
-      baseLeft = rect.left; baseTop = rect.top;
-      startX = e.clientX; startY = e.clientY;
-      panel.style.left = baseLeft + 'px';
-      panel.style.top = baseTop + 'px';
-      panel.style.right = 'auto';
-      panel.style.bottom = 'auto';
-      handle.setPointerCapture(e.pointerId);
-      e.preventDefault();
-    });
-    handle.addEventListener('pointermove', (e) => {
-      if (!dragging) return;
-      const maxL = Math.max(0, win.innerWidth - panel.offsetWidth);
-      const maxT = Math.max(0, win.innerHeight - panel.offsetHeight);
-      const left = Math.min(maxL, Math.max(0, baseLeft + (e.clientX - startX)));
-      const top = Math.min(maxT, Math.max(0, baseTop + (e.clientY - startY)));
-      panel.style.left = left + 'px';
-      panel.style.top = top + 'px';
-    });
-    const end = () => {
-      if (!dragging) return;
-      dragging = false;
-      store.set('pos', {
-        left: parseFloat(panel.style.left) || 0,
-        top: parseFloat(panel.style.top) || 0,
-      });
-    };
-    handle.addEventListener('pointerup', end);
-    handle.addEventListener('pointercancel', end);
   }
 
   function showToast(text) {
@@ -429,11 +461,13 @@
   }, true);
 
   /* ------------------------------------------------------------------ *
-   * Guardian — keeps the panel mounted across SPA navigation and keeps   *
+   * Guardian — keeps the control mounted across SPA navigation and keeps *
    * the active video pinned to the desired rate.                        *
    * ------------------------------------------------------------------ */
   function tick() {
-    buildUi(); // re-mounts if Bilibili's SPA wiped our node
+    buildToast();       // re-mounts if Bilibili's SPA wiped our node
+    ensureBarControl(); // re-mounts / reparks our in-bar control
+    updateUi();
     const videos = document.querySelectorAll('video, audio');
     for (let i = 0; i < videos.length; i++) {
       if (readRate(videos[i]) !== desiredRate) writeRate(videos[i], desiredRate);
@@ -441,11 +475,21 @@
   }
 
   function init() {
-    buildUi();
+    injectCss();
+    buildToast();
+    ensureBarControl();
     updateUi();
     document.addEventListener('fullscreenchange', relocateHost, true);
     document.addEventListener('webkitfullscreenchange', relocateHost, true);
-    window.addEventListener('resize', clampPanel);
+    // Mount the moment the player/control bar appears or is rebuilt, instead of
+    // waiting for the next 1s tick (avoids a brief empty speed slot on load and
+    // SPA navigation). The interval below remains a fallback.
+    if (typeof MutationObserver === 'function' && document.documentElement) {
+      try {
+        new MutationObserver(scheduleMount)
+          .observe(document.documentElement, { childList: true, subtree: true });
+      } catch (e) { /* ignore */ }
+    }
     setInterval(tick, 1000);
   }
 

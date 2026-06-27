@@ -13,15 +13,15 @@ A Tampermonkey userscript that forces manual playback-speed control on Bilibili,
 ## 功能 Features
 
 - **强制调速**：重写 `HTMLMediaElement.prototype.playbackRate`，拦截 B 站把倍速复位到 `1×` 的行为，让你设定的倍速「粘住」。
-- **浮动面板**：可拖动的小面板，预设 `0.5 / 0.75 / 1 / 1.25 / 1.5 / 2 / 3 / 5×`，加减按钮 + 一键复位。面板用 Shadow DOM 隔离，不被站点样式污染。
+- **原位接管倍速菜单**：不再用浮窗，而是把播放器底部那颗「倍速」按钮**原地替换**成脚本自带的菜单，外观与原生一致，预设 `0.5 / 0.75 / 1 / 1.25 / 1.5 / 2 / 3×`。整套菜单（按钮 + 弹层 + 交互）都是脚本自己渲染的，**不依赖** B 站那套（随时可能被进一步锁死的）原生菜单，尽量保证长期有效。
 - **键盘快捷键**：
   - `]` 加速（步进 0.25）
   - `[` 减速（步进 0.25）
   - `\` 恢复 1×
   - 调速时播放器中央会有短暂提示。
-- **记忆倍速**：记住上次使用的倍速（及面板位置），换视频 / 刷新后自动套用。
-- **全屏可用**：进入原生全屏时面板与提示会自动重挂到全屏元素内，依然可见可用。
-- **范围**：`0.25×` ~ `16×`（键盘可微调到 16×，预设到 5×）。
+- **记忆倍速**：记住上次使用的倍速，换视频 / 刷新后自动套用。
+- **全屏可用**：菜单本就嵌在播放器控制栏里，原生全屏 / 网页全屏均可直接使用；中央提示也会在全屏时自动重挂，依然可见。
+- **范围**：`0.25×` ~ `16×`（键盘可微调到 16×，菜单预设到 3×）。
 
 ## 适用页面 Scope
 
@@ -35,16 +35,18 @@ A Tampermonkey userscript that forces manual playback-speed control on Bilibili,
 
 1. 安装 [Tampermonkey](https://www.tampermonkey.net/)（或 Violentmonkey）。
 2. 打开 [`bili-overdrive.user.js`](https://github.com/ChrAlpha/bili-overdrive/raw/main/bili-overdrive.user.js) 链接，脚本管理器会提示安装；或在 Tampermonkey 里「新建脚本」并粘贴文件内容。
-3. 打开任意 B 站视频页，右下角会出现倍速面板。
+3. 打开任意 B 站视频页，播放器底部「倍速」位置即由脚本接管，鼠标悬停即可选速。
 
 ## 工作原理 How it works
 
 脚本在 `@run-at document-start` 时机（早于 B 站播放器代码）重定义 `HTMLMediaElement.prototype.playbackRate` 的 setter：
 
-- 你自己的面板 / 快捷键通过**原生 setter** 直接写入，作为唯一可信来源（`desiredRate`）。
+- 你自己的菜单 / 快捷键通过**原生 setter** 直接写入，作为唯一可信来源（`desiredRate`）。
 - 当外部代码（B 站）尝试把倍速写成 `1×`、而你想要的是非 `1×` 时，视为「登录墙复位」并重新强制回你的倍速。
-- 外部写入的**非 `1×`** 值（例如登录用户用原生菜单选的倍速、或恢复的历史倍速）会被采纳并同步到面板。
+- 外部写入的**非 `1×`** 值（例如登录用户用原生菜单选的倍速、或恢复的历史倍速）会被采纳并同步到菜单。
 - 额外保险：捕获阶段的 `ratechange` 守卫 + 1 秒轮询，应对 SPA 换页与新建的 `<video>` 元素。
+
+UI 方面，脚本用 CSS 隐藏 B 站原生的 `.bpx-player-ctrl-playbackrate` 控件，并在它原来的位置插入一颗自带的「倍速」按钮 + 菜单（`bod-` 前缀的类名、按原生样式绘制）。点击菜单项只调用脚本自己的 `setDesiredRate`，因此连「点 `1.0×` 复位」也不会被上面的强制逻辑吃掉。除了「需要一个控制栏容器来挂载」之外，不依赖 B 站原生倍速菜单的任何 DOM / 事件 / class。
 
 ## 自定义 Customize
 
@@ -52,7 +54,7 @@ A Tampermonkey userscript that forces manual playback-speed control on Bilibili,
 
 ```js
 const CONFIG = {
-  presets: [0.5, 0.75, 1, 1.25, 1.5, 2, 3, 5],
+  presets: [0.5, 0.75, 1, 1.25, 1.5, 2, 3],
   step: 0.25,
   min: 0.25,
   max: 16,
