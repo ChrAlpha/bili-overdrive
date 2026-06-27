@@ -34,7 +34,7 @@ A Tampermonkey userscript that forces manual playback-speed control on Bilibili,
 ## 安装 Install
 
 1. 安装 [Tampermonkey](https://www.tampermonkey.net/)（或 Violentmonkey）。
-2. 打开 [`bili-overdrive.user.js`](./bili-overdrive.user.js) 的 **Raw** 链接，脚本管理器会提示安装；或在 Tampermonkey 里「新建脚本」并粘贴文件内容。
+2. 打开 [`bili-overdrive.user.js`](https://github.com/ChrAlpha/bili-overdrive/raw/main/bili-overdrive.user.js) 链接，脚本管理器会提示安装；或在 Tampermonkey 里「新建脚本」并粘贴文件内容。
 3. 打开任意 B 站视频页，右下角会出现倍速面板。
 
 ## 工作原理 How it works
